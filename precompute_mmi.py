@@ -3,11 +3,11 @@ import numpy as np
 import scipy.signal as sp
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-centre_wavelength = 1.55
+centre_wavelength = 1.45
 bandwidth = 0.1
 subbandwidth = 0.0002
 points_per_subband = 3
-points_per_band = 5
+points_per_band = 30
 
 points = np.linspace(centre_wavelength - bandwidth/2, centre_wavelength + bandwidth/2, points_per_band)
 smatricies = []

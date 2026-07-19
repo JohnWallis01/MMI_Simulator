@@ -3,3 +3,4 @@ conda
 __pycache__
 miniconda.sh
 strip*
+.venv
