@@ -1,6 +1,8 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.signal as sp
+from scipy.interpolate import PchipInterpolator
 
 #CONSTANTS
     #a note on units c=1 and a=1um so all meep units are in microns (including time)
@@ -166,12 +168,123 @@ def main(wavelength_um=1.55, resolution=12, visualise=False):
     return np.array([[S31, S41], [S41, S31]])
 
 
+#precomputed S-parameter data (covers ~1.4-1.6um) sits in these files alongside this script
+_PRECOMPUTED_SPARAM_FILES = ["14-15um.npz", "15-16um.npz"]
+_precomputed_fit_cache = None
+
+def _LoadPrecomputedSMatrixFit():
+    """Loads and fits the precomputed S-matrix data to build interpolators vs wavelength_um."""
+    global _precomputed_fit_cache
+    if _precomputed_fit_cache is not None:
+        return _precomputed_fit_cache
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    wavelengths = []
+    smatricies = []
+    for filename in _PRECOMPUTED_SPARAM_FILES:
+        data = np.load(os.path.join(base_dir, filename))
+        wavelengths.append(data['wavelengths'])
+        smatricies.append(data['smatricies'])
+    wavelengths = np.concatenate(wavelengths)
+    smatricies = np.concatenate(smatricies)
+
+    order = np.argsort(wavelengths)
+    wavelengths = wavelengths[order]
+    smatricies = smatricies[order]
+
+    # the raw data is sampled in tight triplets (~0.0002um apart: a band-centre point
+    # plus two flanking points, meant for estimating group delay via finite difference)
+    # separated by much larger gaps (~0.003um) between triplets/bands. The two files
+    # also overlap by one triplet at their shared boundary. Group consecutive samples
+    # into clusters wherever the gap is small, then take each cluster's centre sample
+    # (not its complex mean!) as the representative point for that band: the physical
+    # propagation phase over the 360um multimode section winds fast enough that phase
+    # can swing tens of degrees across a single triplet, so averaging the complex
+    # values within a cluster partially cancels them and biases |S| low by several
+    # tenths of a dB (verified against the raw per-point magnitude). The centre sample
+    # is an actual measurement, so it carries no such bias.
+    gaps = np.diff(wavelengths)
+    cluster_breaks = np.nonzero(gaps > 0.001)[0] + 1
+    cluster_ids = np.zeros(len(wavelengths), dtype=int)
+    cluster_ids[cluster_breaks] = 1
+    cluster_ids = np.cumsum(cluster_ids)
+    n_clusters = cluster_ids[-1] + 1
+
+    cluster_wavelengths = np.zeros(n_clusters)
+    cluster_smatricies = np.zeros((n_clusters, 2, 2), dtype=complex)
+    for c in range(n_clusters):
+        indices = np.nonzero(cluster_ids == c)[0]
+        centre_index = indices[len(indices)//2]
+        cluster_wavelengths[c] = wavelengths[centre_index]
+        cluster_smatricies[c] = smatricies[centre_index]
+
+    # Fit magnitude (dB) and unwrapped phase (radians) separately rather than real/imag:
+    # magnitude(dB) is the slowly-varying, visually-checkable envelope, while phase is
+    # sensitive to noise wherever |S| dips low - separating them lets each be smoothed
+    # on its own terms instead of a real/imag fit distorting one to accommodate the other.
+    # Only (0,0)=S31 and (1,0)=S41 are independent; (0,1)/(1,1) mirror them (see the
+    # symmetry note above main()'s return in this file).
+    fits = {}
+    for i, j in [(0, 0), (1, 0)]:
+        cluster_vals = cluster_smatricies[:, i, j]
+        mag_db = 20*np.log10(np.abs(cluster_vals))
+        phase_rad = np.unwrap(np.angle(cluster_vals))
+        phase_rad = _DespikePhase(phase_rad)
+        mag_fit = PchipInterpolator(cluster_wavelengths, mag_db)
+        phase_fit = PchipInterpolator(cluster_wavelengths, phase_rad)
+        fits[(i, j)] = (mag_fit, phase_fit)
+    fits[(0, 1)] = fits[(1, 0)]
+    fits[(1, 1)] = fits[(0, 0)]
+
+    _precomputed_fit_cache = (cluster_wavelengths, fits)
+    return _precomputed_fit_cache
+
+
+def _DespikePhase(phase_rad, window=5, n_sigma=3.0):
+    """Pulls outlier samples back toward the local trend (Hampel filter).
+
+    A handful of the precomputed points carry simulation noise that shows up as an
+    isolated jump against the otherwise-smooth unwrapped phase trend. Interpolating
+    through such a point exactly (as PchipInterpolator does) reproduces the jump as a
+    spurious spike in the fitted curve. This detects samples that sit more than
+    n_sigma robust-standard-deviations from their local (windowed) median and snaps
+    them to that median before fitting.
+    """
+    n = len(phase_rad)
+    corrected = phase_rad.copy()
+    half_window = window // 2
+    for k in range(n):
+        lo, hi = max(0, k - half_window), min(n, k + half_window + 1)
+        neighbours = np.concatenate([phase_rad[lo:k], phase_rad[k+1:hi]])
+        median = np.median(neighbours)
+        mad = np.median(np.abs(neighbours - median)) * 1.4826  # ~= robust std for gaussian noise
+        if mad < 1e-9:
+            continue
+        if np.abs(phase_rad[k] - median) > n_sigma * mad:
+            corrected[k] = median
+    return corrected
+
+
+def FittedSMatrix(wavelength_um):
+    """Returns the S-matrix at wavelength_um, fitted from the precomputed data (~1.4-1.6um)."""
+    fit_wavelengths, fits = _LoadPrecomputedSMatrixFit()
+    wl_min, wl_max = fit_wavelengths[0], fit_wavelengths[-1]
+    if not (wl_min <= wavelength_um <= wl_max):
+        raise ValueError(
+            f"No precomputed S-parameter data at {wavelength_um:.4f}um; "
+            f"precomputed data only covers {wl_min:.4f}-{wl_max:.4f}um."
+        )
+    S = np.zeros((2, 2), dtype=complex)
+    for (i, j), (mag_fit, phase_fit) in fits.items():
+        S[i, j] = 10**(mag_fit(wavelength_um)/20) * np.exp(1j*phase_fit(wavelength_um))
+    return S
+
+
 def MMI_SMatrix(wavelength_um, example=False, precomputed=False):
     if example:
         return np.array([[1, 1j], [1j, 1]])/np.sqrt(2)
     if precomputed:
-        # Return precomputed S-parameters if available
-        pass
+        return FittedSMatrix(wavelength_um)
     return main(wavelength_um=wavelength_um, resolution=12, visualise=False)
 
 

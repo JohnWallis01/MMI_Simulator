@@ -4,3 +4,4 @@ __pycache__
 miniconda.sh
 strip*
 .venv
+ai_workspace
