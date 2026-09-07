@@ -280,12 +280,180 @@ def FittedSMatrix(wavelength_um):
     return S
 
 
-def MMI_SMatrix(wavelength_um, example=False, precomputed=False):
+# ---------------------------------------------------------------------------
+# Eigenmode / pulsed engine (the default). One broadband Gaussian pulse of the
+# fundamental waveguide mode is launched into the input port; DFT mode monitors
+# in the input and both output waveguides record the S-parameters across the
+# whole band in a single run, and the fields are run until they decay
+# (stop_when_fields_decayed). Unlike the CW-snapshot method (main() above), this
+# is transient-free, so it does not carry the settling ripple, and it covers the
+# entire band at once. S31 = b3(+)/a1(+), S41 = b4(+)/a1(+): forward mode
+# coefficient at each output waveguide over the forward (incident) coefficient at
+# the input waveguide (the ratio cancels the source spectrum).
+# ---------------------------------------------------------------------------
+
+_EIGENMODE_BAND_UM = (1.4, 1.6)        # default band for a live eigenmode run
+_EIGENMODE_MON_H = 6.0                  # monitor / source transverse height (um)
+
+
+def RunEigenmodeBand(nfreq=120, resolution=12, decay_by=1e-3,
+                     band_um=_EIGENMODE_BAND_UM):
+    """Broadband pulsed/eigenmode S-parameters across band_um in ONE simulation.
+
+    Returns (wavelengths_um ascending, S31 array, S41 array).
+    """
+    global mp
+    import meep as mp
+
+    geometry, cell = GenerateMMIGeometry(sm_waveguide_length=sm_waveguide_length,
+                                         sm_waveguide_width=sm_waveguide_width,
+                                         sm_waveguide_spacing=sm_waveguide_spacing,
+                                         mm_waveguide_length=mm_waveguide_length,
+                                         mm_waveguide_width=mm_waveguide_width,
+                                         taper_length=taper_length,
+                                         taper_output_width=taper_output_width)
+    cell_x = cell[0]
+    y_port = sm_waveguide_spacing / 2.0          # bottom = -y_port (input & through), top = +y_port (cross)
+    x_src = -cell_x/2 + 8                          # source, inside the input waveguide
+    x_in = -cell_x/2 + 20                          # input monitor, downstream of the source
+    x_out = cell_x/2 - 20                          # output monitors, inside the output waveguides
+
+    fmin, fmax = 1.0/band_um[1], 1.0/band_um[0]
+    fcen = 0.5*(fmin + fmax)
+    df = 1.25*(fmax - fmin)                        # slightly wider than the band for flat coverage
+
+    sources = [mp.EigenModeSource(
+        src=mp.GaussianSource(fcen, fwidth=df),
+        center=mp.Vector3(x_src, -y_port),
+        size=mp.Vector3(0, _EIGENMODE_MON_H),
+        eig_band=1,
+        eig_parity=mp.ODD_Z,
+        eig_match_freq=True)]
+
+    sim = mp.Simulation(cell_size=cell,
+                        boundary_layers=[mp.PML(1.0)],
+                        geometry=geometry,
+                        sources=sources,
+                        resolution=resolution,
+                        default_material=mp.Medium(epsilon=SIO2_epsilon))
+
+    freqs = np.linspace(fmin, fmax, nfreq)
+    mon_in = sim.add_mode_monitor(freqs, mp.FluxRegion(center=mp.Vector3(x_in, -y_port),
+                                                       size=mp.Vector3(0, _EIGENMODE_MON_H)))
+    mon_thru = sim.add_mode_monitor(freqs, mp.FluxRegion(center=mp.Vector3(x_out, -y_port),
+                                                         size=mp.Vector3(0, _EIGENMODE_MON_H)))
+    mon_cross = sim.add_mode_monitor(freqs, mp.FluxRegion(center=mp.Vector3(x_out, +y_port),
+                                                          size=mp.Vector3(0, _EIGENMODE_MON_H)))
+
+    # The device is ~560 um long: the pulse needs ~700 t.u. to reach the outputs,
+    # well after the source ends. Run a fixed traversal interval first so the
+    # pulse actually arrives, THEN watch the output field decay to steady state
+    # (calling stop_when_fields_decayed before the pulse arrives stops it at ~0).
+    sim.run(until_after_sources=1000)
+    sim.run(until_after_sources=mp.stop_when_fields_decayed(
+        50, mp.Ez, mp.Vector3(x_out, -y_port), decay_by))
+
+    def fwd(mon):
+        r = sim.get_eigenmode_coefficients(mon, [1], eig_parity=mp.ODD_Z)
+        return r.alpha[0, :, 0]                    # band 0, all freqs, +x direction
+
+    a1, b3, b4 = fwd(mon_in), fwd(mon_thru), fwd(mon_cross)
+    S31 = b3 / a1
+    S41 = b4 / a1
+    wl = 1.0 / freqs
+    order = np.argsort(wl)
+    return wl[order], S31[order], S41[order]
+
+
+# precomputed eigenmode band (covers 1.4-1.6um) sits alongside this script
+_PRECOMPUTED_EIGENMODE_FILE = "precomputed_eigenmode.npz"
+_eigenmode_fit_cache = None
+_live_eigenmode_cache = None
+
+
+def _BuildSMatrixFit(wavelengths, smatricies):
+    """PCHIP interpolators (magnitude dB + unwrapped phase) for S31 and S41.
+
+    The eigenmode data is smooth (transient-free), so no despiking is needed --
+    contrast _LoadPrecomputedSMatrixFit for the noisier CW data.
+    """
+    order = np.argsort(wavelengths)
+    wavelengths = wavelengths[order]
+    smatricies = smatricies[order]
+    fits = {}
+    for i, j in [(0, 0), (1, 0)]:
+        vals = smatricies[:, i, j]
+        mag_db = 20*np.log10(np.abs(vals))
+        phase_rad = np.unwrap(np.angle(vals))
+        fits[(i, j)] = (PchipInterpolator(wavelengths, mag_db),
+                        PchipInterpolator(wavelengths, phase_rad))
+    fits[(0, 1)] = fits[(1, 0)]
+    fits[(1, 1)] = fits[(0, 0)]
+    return wavelengths, fits
+
+
+def _EvalSMatrixFit(wavelength_um, fit_wavelengths, fits, what):
+    wl_min, wl_max = fit_wavelengths[0], fit_wavelengths[-1]
+    if not (wl_min <= wavelength_um <= wl_max):
+        raise ValueError(
+            f"No {what} at {wavelength_um:.4f}um; it only covers "
+            f"{wl_min:.4f}-{wl_max:.4f}um.")
+    S = np.zeros((2, 2), dtype=complex)
+    for (i, j), (mag_fit, phase_fit) in fits.items():
+        S[i, j] = 10**(mag_fit(wavelength_um)/20) * np.exp(1j*phase_fit(wavelength_um))
+    return S
+
+
+def _LoadPrecomputedEigenmodeFit():
+    global _eigenmode_fit_cache
+    if _eigenmode_fit_cache is None:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        data = np.load(os.path.join(base_dir, _PRECOMPUTED_EIGENMODE_FILE))
+        _eigenmode_fit_cache = _BuildSMatrixFit(data['wavelengths'], data['smatricies'])
+    return _eigenmode_fit_cache
+
+
+def EigenmodeSMatrix(wavelength_um):
+    """S-matrix at wavelength_um, interpolated from the precomputed eigenmode band."""
+    fit_wavelengths, fits = _LoadPrecomputedEigenmodeFit()
+    return _EvalSMatrixFit(wavelength_um, fit_wavelengths, fits, "precomputed eigenmode data")
+
+
+def LiveEigenmodeSMatrix(wavelength_um, resolution=12):
+    """S-matrix at wavelength_um from a live eigenmode run. The whole band is
+    computed once and cached in-process, so repeated calls are cheap."""
+    global _live_eigenmode_cache
+    cache = _live_eigenmode_cache
+    if cache is None or not (cache[0][0] <= wavelength_um <= cache[0][-1]):
+        wl, S31, S41 = RunEigenmodeBand(resolution=resolution)
+        smat = np.zeros((len(wl), 2, 2), dtype=complex)
+        smat[:, 0, 0] = S31
+        smat[:, 1, 0] = S41
+        smat[:, 0, 1] = S41
+        smat[:, 1, 1] = S31
+        _live_eigenmode_cache = cache = (wl, *_BuildSMatrixFit(wl, smat)[1:], smat)
+    wl, fits = cache[0], cache[1]
+    return _EvalSMatrixFit(wavelength_um, wl, fits, "live eigenmode band")
+
+
+def MMI_SMatrix(wavelength_um, example=False, precomputed=True, engine="eigenmode"):
+    """S-matrix of the 2x2 MMI at wavelength_um.
+
+    engine="eigenmode" (default): pulsed/eigenmode extraction (transient-free).
+    engine="cw": the legacy ContinuousSource + Hilbert-snapshot method.
+    precomputed=True (default): interpolate saved band data (fast, no simulation).
+    precomputed=False: run the chosen engine live.
+    example=True: return the ideal 1/sqrt(2)*[[1,1j],[1j,1]] matrix.
+    """
     if example:
         return np.array([[1, 1j], [1j, 1]])/np.sqrt(2)
     if precomputed:
-        return FittedSMatrix(wavelength_um)
-    return main(wavelength_um=wavelength_um, resolution=12, visualise=False)
+        if engine == "cw":
+            return FittedSMatrix(wavelength_um)
+        return EigenmodeSMatrix(wavelength_um)
+    if engine == "cw":
+        return main(wavelength_um=wavelength_um, resolution=12, visualise=False)
+    return LiveEigenmodeSMatrix(wavelength_um)
 
 
 if __name__ == "__main__":
