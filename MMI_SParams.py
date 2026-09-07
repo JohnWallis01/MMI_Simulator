@@ -6,15 +6,24 @@ from scipy.interpolate import PchipInterpolator
 
 #CONSTANTS
     #a note on units c=1 and a=1um so all meep units are in microns (including time)
-SIN_epsilon = 1.974
-SIO2_epsilon = 1.4657
+# These are refractive INDICES (SiN ~1.97, SiO2 ~1.47). meep materials take
+# permittivity, so epsilon = n**2. (Previously the index values were passed
+# straight into mp.Medium(epsilon=...), which modelled n=sqrt(1.974)~1.40 etc.)
+SIN_index = 1.974
+SIO2_index = 1.4657
+SIN_epsilon = SIN_index**2
+SIO2_epsilon = SIO2_index**2
 
 #device parameters
 sm_waveguide_length=50
 sm_waveguide_width=1
-sm_waveguide_spacing=8
-mm_waveguide_length=360
-mm_waveguide_width=24
+sm_waveguide_spacing=6    # = mm_waveguide_width/3: inputs at +-W/6 (paired interference)
+# Geometry tuned (corrected n=1.974/1.4657 indices) for a broadband 3-dB coupler
+# centred at 1550nm. W was narrowed 24->18 (with L and spacing co-scaled) to flatten
+# the band: |imbalance|<0.5dB over ~1400-1720nm, <0.7dB loss over 1450-1650nm.
+# See ai_workspace/optimize_geometry.py and tune_width.py. (Originals: L360/W24/s8.)
+mm_waveguide_length=266
+mm_waveguide_width=18
 taper_length=50
 taper_output_width=5
 
@@ -97,7 +106,7 @@ def RunMMISimulation(wavelength_um, resolution):
                         resolution=resolution,
                         default_material=mp.Medium(epsilon=SIO2_epsilon))
 
-    sim.run(until=SIN_epsilon*cell_x_um) #light has just reached the end of the device
+    sim.run(until=SIN_index*cell_x_um) #light has just reached the end of the device (n*L transit)
     return sim
 
 def VisualiseDevice(sim, LOG=True):
@@ -292,7 +301,7 @@ def FittedSMatrix(wavelength_um):
 # the input waveguide (the ratio cancels the source spectrum).
 # ---------------------------------------------------------------------------
 
-_EIGENMODE_BAND_UM = (1.4, 1.6)        # default band for a live eigenmode run
+_EIGENMODE_BAND_UM = (1.4, 1.7)        # default band for a live eigenmode run
 _EIGENMODE_MON_H = 6.0                  # monitor / source transverse height (um)
 
 
