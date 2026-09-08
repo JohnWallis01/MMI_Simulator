@@ -3,7 +3,7 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.signal as sp
-from scipy.interpolate import PchipInterpolator
+from scipy.interpolate import PchipInterpolator, RegularGridInterpolator
 
 mp = None  # meep is imported lazily (see _ensure_meep); some callers inject it as MMI_SParams.mp
 
@@ -625,22 +625,95 @@ def LiveDeviceSMatrix(config, wavelength_um, **overrides):
     return AssembleSMatrix(config, S_row)
 
 
-def DeviceSMatrix(config, wavelength_um, precomputed=True):
+# ---------------------------------------------------------------------------
+# Thermo-optic MZI node (kind="mzi_node"): two 2x2 MMIs + s-bend routing + two
+# top-arm heaters. Takes temperatures (heater rise in K); returns the 2x2 node
+# S-matrix. S = t^4 * S_MMI @ diag(e^{i theta},1) @ S_MMI @ diag(e^{i phi},1),
+# theta from the middle (coupling) heater, phi from the input (phase) heater.
+# ---------------------------------------------------------------------------
+
+_mzi_grid_cache = {}
+_mzi_sbend_cache = {}
+
+
+def _mzi_temperatures(config, temperatures):
+    """Map a temperatures dict/tuple to (T_middle, T_input) in K rise."""
+    names = [h["name"] for h in config["heaters"]]
+    if temperatures is None:
+        temps = {}
+    elif isinstance(temperatures, dict):
+        temps = {str(k): float(v) for k, v in temperatures.items()}
+    else:
+        temps = {n: float(v) for n, v in zip(names, temperatures)}
+    return temps.get("middle", 0.0), temps.get("input", 0.0)
+
+
+def load_mzi_grid(config):
+    """Return the raw exported two-heater dataset (wavelengths, T_mid, T_in, S) for
+    a kind='mzi_node' device. S has shape (Nw, N_Tmid, N_Tin, 2, 2). Each point is
+    exact; do NOT linearly interpolate S over wavelength (its propagation phase
+    winds >180 deg per grid step) -- use MZINodeSMatrix for off-grid queries."""
+    config = _cfg(config)
+    key = os.path.join(config["_dir"], config["precomputed"])
+    if key not in _mzi_grid_cache:
+        _mzi_grid_cache[key] = np.load(key)
+    d = _mzi_grid_cache[key]
+    return d["wavelengths"], d["T_mid"], d["T_in"], d["S"]
+
+
+def _mzi_sbend_t(config, wavelength_um):
+    key = os.path.join(config["_dir"], config["sbend"])
+    if key not in _mzi_sbend_cache:
+        sb = np.load(key)
+        o = np.argsort(sb["wavelengths"])
+        _mzi_sbend_cache[key] = (sb["wavelengths"][o], np.abs(sb["t"][o]),
+                                 np.unwrap(np.angle(sb["t"][o])))
+    wls, mag, ph = _mzi_sbend_cache[key]
+    return np.interp(wavelength_um, wls, mag) * np.exp(1j*np.interp(wavelength_um, wls, ph))
+
+
+def MZINodeSMatrix(config, wavelength_um, T_middle=0.0, T_input=0.0, precomputed=True):
+    """2x2 S-matrix of the thermo-optic MZI node at wavelength_um for the given
+    heater temperature rises (K). Assembled from the precomputed base MMI + s-bend
+    bands plus the analytic heater phases (fast and exact for magnitude/split/loss
+    and the physical relative phases). The `precomputed` flag is accepted for API
+    consistency; the exported grid (load_mzi_grid) is a dense dataset, not used for
+    interpolation because the node's propagation phase winds >180 deg per grid step."""
+    config = _cfg(config)
+    base = load_config(os.path.join(config["_dir"], config["base_mmi"]))
+    a = MMI_SMatrix(base, wavelength_um)                       # 2x2 MMI
+    th = config["thermo"]
+    ph_mid = 2*np.pi*th["dn_dT"]*T_middle*th["heater_length_um"]/wavelength_um
+    ph_in = 2*np.pi*th["dn_dT"]*T_input*th["heater_length_um"]/wavelength_um
+    Pm = np.array([[np.exp(1j*ph_mid), 0], [0, 1]])
+    Pi = np.array([[np.exp(1j*ph_in), 0], [0, 1]])
+    t = _mzi_sbend_t(config, wavelength_um)
+    return (t**th["n_sbends_per_path"]) * (a @ Pm @ a @ Pi)
+
+
+def DeviceSMatrix(config, wavelength_um, precomputed=True, temperatures=None):
     """S-matrix of a config-described device at wavelength_um (um). config may be a
     path to a config.json or a loaded dict. precomputed=True interpolates the
-    device's precomputed.npz; precomputed=False runs the eigenmode engine live."""
+    device's precomputed data; precomputed=False computes/runs it live.
+
+    For kind="mzi_node", pass temperatures = {"middle": K, "input": K} (heater rise)."""
     config = _cfg(config)
+    if config.get("kind") == "mzi_node":
+        Tm, Ti = _mzi_temperatures(config, temperatures)
+        return MZINodeSMatrix(config, wavelength_um, Tm, Ti, precomputed=precomputed)
     return (PrecomputedDeviceSMatrix(config, wavelength_um) if precomputed
             else LiveDeviceSMatrix(config, wavelength_um))
 
 
 def MMI_SMatrix(config_or_wavelength, wavelength_um=None, example=False,
-                precomputed=True, engine="eigenmode"):
+                precomputed=True, engine="eigenmode", temperatures=None):
     """S-matrix of an MMI device.
 
     Config-driven form (preferred): MMI_SMatrix(config, wavelength_um) where config
     is a path to a device config.json (or a loaded dict). precomputed=True (default)
     interpolates the device's precomputed band; precomputed=False runs it live.
+    For a thermo-optic node (kind="mzi_node") pass temperatures = {"middle": K,
+    "input": K} (heater rise above ambient).
 
     Legacy form: MMI_SMatrix(wavelength_um, ...) uses the module-global default 2x2
     device (kept for older scripts). engine="cw" selects the legacy Hilbert method.
@@ -651,7 +724,8 @@ def MMI_SMatrix(config_or_wavelength, wavelength_um=None, example=False,
         if example:
             return (np.array([[1.0]]) if config["kind"] == "1x1"
                     else np.array([[1, 1j], [1j, 1]]) / np.sqrt(2))
-        return DeviceSMatrix(config, wavelength_um, precomputed=precomputed)
+        return DeviceSMatrix(config, wavelength_um, precomputed=precomputed,
+                             temperatures=temperatures)
 
     # ---- legacy float-wavelength form (default 2x2 module-global device) ----
     wl = config_or_wavelength

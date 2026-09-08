@@ -1,0 +1,14 @@
+{
+  "name": "mzi_node",
+  "kind": "mzi_node",
+  "description": "Thermo-optic 2x2 MZI node: two optimised 2x2 MMIs joined by the Table-1 s-bend routing, with two top-arm heaters. The middle heater sets the coupling phase theta (3/6/10 dB), the input heater sets the external phase phi. S = t^4 * S_MMI @ diag(e^{i theta},1) @ S_MMI @ diag(e^{i phi},1). Temperatures are the heater RISE (K) above ambient.",
+  "base_mmi": "../mmi_2x2/config.json",
+  "sbend": "sbend.npz",
+  "thermo": {"dn_dT": 2.269e-5, "heater_length_um": 350.0, "n_sbends_per_path": 4},
+  "heaters": [
+    {"name": "middle", "role": "coupling", "arm": "top"},
+    {"name": "input",  "role": "phase",    "arm": "top"}
+  ],
+  "temperature_units": "K rise above ambient",
+  "precomputed": "precomputed.npz"
+}
