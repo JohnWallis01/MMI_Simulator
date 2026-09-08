@@ -6,3 +6,4 @@ strip*
 .venv
 ai_workspace
 dummyMMI
+.claude
