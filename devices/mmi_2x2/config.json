@@ -1,0 +1,18 @@
+{
+  "name": "mmi_2x2",
+  "description": "Optimised broadband 3-dB 2x2 MMI coupler, centred at 1550 nm (W=18, L=266 um). |imbalance|<0.2 dB over 1400-1700 nm, 0.10 dB loss and -90 deg quadrature at 1550 nm.",
+  "kind": "2x2",
+  "material": {"core_index": 1.974, "clad_index": 1.4657},
+  "waveguide": {"sm_length": 50.0, "sm_width": 1.0, "taper_length": 50.0, "taper_output_width": 5.0},
+  "mmi": {"length": 266.0, "width": 18.0},
+  "ports": {
+    "inputs":  [{"name": "P1_top", "y": 3.0}, {"name": "P2_bottom", "y": -3.0}],
+    "outputs": [{"name": "P3_through", "y": -3.0}, {"name": "P4_cross", "y": 3.0}],
+    "drive": "P2_bottom",
+    "through": "P3_through",
+    "cross": "P4_cross"
+  },
+  "eigenmode": {"band_um": [1.4, 1.7], "nfreq": 140, "resolution": 12, "decay_by": 0.001,
+                "monitor_height": 6.0, "source_offset": 8.0, "monitor_offset": 20.0},
+  "precomputed": "precomputed.npz"
+}

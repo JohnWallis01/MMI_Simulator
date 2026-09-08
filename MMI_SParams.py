@@ -1,8 +1,21 @@
 import os
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.signal as sp
 from scipy.interpolate import PchipInterpolator
+
+mp = None  # meep is imported lazily (see _ensure_meep); some callers inject it as MMI_SParams.mp
+
+
+def _ensure_meep():
+    """Import meep into the module global `mp` on first use (keeps the module
+    importable, e.g. for the precomputed path, on machines without meep)."""
+    global mp
+    if mp is None:
+        import meep as _meep
+        mp = _meep
+    return mp
 
 #CONSTANTS
     #a note on units c=1 and a=1um so all meep units are in microns (including time)
@@ -27,7 +40,8 @@ mm_waveguide_width=18
 taper_length=50
 taper_output_width=5
 
-def GenerateTaperGeometry(taper_length, taper_input_width, taper_output_width, start_position_x, start_position_y, direction):
+def GenerateTaperGeometry(taper_length, taper_input_width, taper_output_width, start_position_x, start_position_y, direction, core_eps=None):
+    core_eps = SIN_epsilon if core_eps is None else core_eps
     if direction == 'right':
         taper_verticies = [mp.Vector3(start_position_x, start_position_y - taper_input_width/2),
                                     mp.Vector3(start_position_x + taper_length, start_position_y - taper_output_width/2),
@@ -40,15 +54,16 @@ def GenerateTaperGeometry(taper_length, taper_input_width, taper_output_width, s
                                     mp.Vector3(start_position_x, start_position_y + taper_input_width/2)]
     else:
         raise ValueError("Direction must be 'right' or 'left'")
-    taper = mp.Prism(taper_verticies,height=mp.inf,material=mp.Medium(epsilon=SIN_epsilon))
+    taper = mp.Prism(taper_verticies,height=mp.inf,material=mp.Medium(epsilon=core_eps))
     return taper
 
-def GenerateWaveguideGeometry(waveguide_length, waveguide_width, start_position_x, start_position_y):
+def GenerateWaveguideGeometry(waveguide_length, waveguide_width, start_position_x, start_position_y, core_eps=None):
+    core_eps = SIN_epsilon if core_eps is None else core_eps
     waveguide_verticies = [mp.Vector3(start_position_x, start_position_y - 0.5*waveguide_width),
                                          mp.Vector3(start_position_x + waveguide_length, start_position_y - 0.5*waveguide_width),
                                          mp.Vector3(start_position_x + waveguide_length, start_position_y + 0.5*waveguide_width),
                                          mp.Vector3(start_position_x, start_position_y + 0.5*waveguide_width)]
-    waveguide = mp.Prism(waveguide_verticies,height=mp.inf,material=mp.Medium(epsilon=SIN_epsilon))
+    waveguide = mp.Prism(waveguide_verticies,height=mp.inf,material=mp.Medium(epsilon=core_eps))
     return waveguide
 
 def GenerateMMIGeometry(   sm_waveguide_length, sm_waveguide_width,
@@ -445,24 +460,206 @@ def LiveEigenmodeSMatrix(wavelength_um, resolution=12):
     return _EvalSMatrixFit(wavelength_um, wl, fits, "live eigenmode band")
 
 
-def MMI_SMatrix(wavelength_um, example=False, precomputed=True, engine="eigenmode"):
-    """S-matrix of the 2x2 MMI at wavelength_um.
+# ===========================================================================
+# CONFIG-DRIVEN DEVICE API
+# ---------------------------------------------------------------------------
+# A device is described by a JSON config (see devices/*/config.json): material
+# indices, waveguide/taper/MMI dimensions, and the port layout (input & output
+# waveguide y-positions, which input is driven, and how the returned S-matrix is
+# assembled). The same eigenmode/pulsed engine as above runs for any port layout,
+# so both the 2x2 coupler and the 1x1 relay use one code path. Each device folder
+# also holds a precomputed.npz band, interpolated by default (no simulation).
+#
+# Config schema:
+#   kind:      "2x2" or "1x1" (how MMI_SMatrix assembles the returned matrix)
+#   material:  {core_index, clad_index}
+#   waveguide: {sm_length, sm_width, taper_length, taper_output_width}
+#   mmi:       {length, width}
+#   ports:     inputs/outputs = [{name, y}, ...]; drive = <input name>;
+#              for 2x2 also through/cross = <output names>
+#   eigenmode: {band_um, nfreq, resolution, decay_by, monitor_height,
+#               source_offset, monitor_offset}
+#   precomputed: filename (relative to the config) of the precomputed band
+#     (keys: wavelengths (N,), S (N, n_outputs) complex transmission per output)
+# ===========================================================================
 
-    engine="eigenmode" (default): pulsed/eigenmode extraction (transient-free).
-    engine="cw": the legacy ContinuousSource + Hilbert-snapshot method.
-    precomputed=True (default): interpolate saved band data (fast, no simulation).
-    precomputed=False: run the chosen engine live.
-    example=True: return the ideal 1/sqrt(2)*[[1,1j],[1j,1]] matrix.
+_device_fit_cache = {}
+_device_live_cache = {}
+
+
+def load_config(path):
+    """Load a device config JSON; records its directory for resolving files."""
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg["_dir"] = os.path.dirname(os.path.abspath(path))
+    return cfg
+
+
+def _cfg(config):
+    return load_config(config) if isinstance(config, str) else config
+
+
+def BuildDeviceGeometry(config):
+    """Geometry for any port layout: input waveguides+tapers on the left, the MMI
+    slab in the centre, output tapers+waveguides on the right."""
+    _ensure_meep()
+    wg, mm = config["waveguide"], config["mmi"]
+    core_eps = config["material"]["core_index"]**2
+    sm_len, sm_w = wg["sm_length"], wg["sm_width"]
+    tp_len, tp_w = wg["taper_length"], wg["taper_output_width"]
+    L, W = mm["length"], mm["width"]
+    cell_x = L + 2*sm_len + 2*tp_len
+    cell_y = float(np.ceil(1.2 * W))
+    g = []
+    for p in config["ports"]["inputs"]:
+        g.append(GenerateWaveguideGeometry(sm_len, sm_w, -cell_x/2, p["y"], core_eps=core_eps))
+        g.append(GenerateTaperGeometry(tp_len, sm_w, tp_w, -cell_x/2 + sm_len, p["y"], 'right', core_eps=core_eps))
+    for p in config["ports"]["outputs"]:
+        g.append(GenerateTaperGeometry(tp_len, sm_w, tp_w, cell_x/2 - sm_len, p["y"], 'left', core_eps=core_eps))
+        g.append(GenerateWaveguideGeometry(sm_len, sm_w, cell_x/2 - sm_len, p["y"], core_eps=core_eps))
+    g.append(GenerateWaveguideGeometry(L, W, -cell_x/2 + sm_len + tp_len, 0, core_eps=core_eps))
+    return g, mp.Vector3(cell_x, cell_y, 0)
+
+
+def RunDeviceEigenmodeBand(config, nfreq=None, resolution=None, decay_by=None, band_um=None):
+    """Broadband eigenmode transmission of a config device: drive the config's
+    input, monitor every output. Returns (wl ascending, S) with S shape
+    (n_outputs, N) = forward output coeff / forward input coeff per output."""
+    _ensure_meep()
+    eig = config["eigenmode"]
+    nfreq = int(nfreq or eig["nfreq"])
+    resolution = int(resolution or eig["resolution"])
+    decay_by = float(decay_by or eig["decay_by"])
+    band_um = tuple(band_um or eig["band_um"])
+    monh = eig.get("monitor_height", 6.0)
+    soff = eig.get("source_offset", 8.0)
+    moff = eig.get("monitor_offset", 20.0)
+
+    geometry, cell = BuildDeviceGeometry(config)
+    cell_x = cell[0]
+    ports = config["ports"]
+    drive = next(p for p in ports["inputs"] if p["name"] == ports["drive"])
+    x_src, x_in, x_out = -cell_x/2 + soff, -cell_x/2 + moff, cell_x/2 - moff
+    fmin, fmax = 1.0/band_um[1], 1.0/band_um[0]
+    fcen, df = 0.5*(fmin + fmax), 1.25*(fmax - fmin)
+
+    sources = [mp.EigenModeSource(src=mp.GaussianSource(fcen, fwidth=df),
+                                  center=mp.Vector3(x_src, drive["y"]), size=mp.Vector3(0, monh),
+                                  eig_band=1, eig_parity=mp.ODD_Z, eig_match_freq=True)]
+    sim = mp.Simulation(cell_size=cell, boundary_layers=[mp.PML(1.0)], geometry=geometry,
+                        sources=sources, resolution=resolution,
+                        default_material=mp.Medium(epsilon=config["material"]["clad_index"]**2))
+    freqs = np.linspace(fmin, fmax, nfreq)
+    mon_in = sim.add_mode_monitor(freqs, mp.FluxRegion(center=mp.Vector3(x_in, drive["y"]),
+                                                       size=mp.Vector3(0, monh)))
+    mon_out = [sim.add_mode_monitor(freqs, mp.FluxRegion(center=mp.Vector3(x_out, p["y"]),
+                                                         size=mp.Vector3(0, monh)))
+               for p in ports["outputs"]]
+    sim.run(until_after_sources=1000)
+    sim.run(until_after_sources=mp.stop_when_fields_decayed(
+        50, mp.Ez, mp.Vector3(x_out, ports["outputs"][0]["y"]), decay_by))
+
+    def fwd(mon):
+        return sim.get_eigenmode_coefficients(mon, [1], eig_parity=mp.ODD_Z).alpha[0, :, 0]
+    a1 = fwd(mon_in)
+    S = np.array([fwd(m) / a1 for m in mon_out])   # (n_out, N)
+    wl = 1.0 / freqs
+    order = np.argsort(wl)
+    return wl[order], S[:, order]
+
+
+def AssembleSMatrix(config, S_row):
+    """Assemble the device S-matrix from the per-output transmission row."""
+    kind = config["kind"]
+    out_names = [p["name"] for p in config["ports"]["outputs"]]
+    if kind == "1x1":
+        return np.array([[S_row[0]]], dtype=complex)
+    if kind == "2x2":
+        thru = S_row[out_names.index(config["ports"]["through"])]
+        cross = S_row[out_names.index(config["ports"]["cross"])]
+        return np.array([[thru, cross], [cross, thru]], dtype=complex)
+    raise ValueError(f"unknown device kind {kind!r}")
+
+
+def _fit_columns(wl, S):
+    """PCHIP (magnitude dB + unwrapped phase) per output column of S (N, n_out)."""
+    order = np.argsort(wl); wl = wl[order]; S = S[order]
+    fits = []
+    for k in range(S.shape[1]):
+        vals = S[:, k]
+        fits.append((PchipInterpolator(wl, 20*np.log10(np.abs(vals))),
+                     PchipInterpolator(wl, np.unwrap(np.angle(vals)))))
+    return wl, fits
+
+
+def _eval_columns(wl, fits, wavelength_um, what):
+    if not (wl[0] <= wavelength_um <= wl[-1]):
+        raise ValueError(f"No {what} at {wavelength_um:.4f}um; it only covers "
+                         f"{wl[0]:.4f}-{wl[-1]:.4f}um.")
+    return np.array([10**(mf(wavelength_um)/20) * np.exp(1j*pf(wavelength_um))
+                     for mf, pf in fits])
+
+
+def _load_device_fit(config):
+    key = config["_dir"] + "/" + config["precomputed"]
+    if key not in _device_fit_cache:
+        data = np.load(os.path.join(config["_dir"], config["precomputed"]))
+        _device_fit_cache[key] = _fit_columns(data["wavelengths"], data["S"])
+    return _device_fit_cache[key]
+
+
+def PrecomputedDeviceSMatrix(config, wavelength_um):
+    wl, fits = _load_device_fit(config)
+    S_row = _eval_columns(wl, fits, wavelength_um, f"precomputed data for {config['name']}")
+    return AssembleSMatrix(config, S_row)
+
+
+def LiveDeviceSMatrix(config, wavelength_um, **overrides):
+    key = config["_dir"]
+    cache = _device_live_cache.get(key)
+    if cache is None or not (cache[0][0] <= wavelength_um <= cache[0][-1]):
+        wl, S = RunDeviceEigenmodeBand(config, **overrides)   # S (n_out, N)
+        _device_live_cache[key] = cache = _fit_columns(wl, S.T)
+    wl, fits = cache
+    S_row = _eval_columns(wl, fits, wavelength_um, f"live band for {config['name']}")
+    return AssembleSMatrix(config, S_row)
+
+
+def DeviceSMatrix(config, wavelength_um, precomputed=True):
+    """S-matrix of a config-described device at wavelength_um (um). config may be a
+    path to a config.json or a loaded dict. precomputed=True interpolates the
+    device's precomputed.npz; precomputed=False runs the eigenmode engine live."""
+    config = _cfg(config)
+    return (PrecomputedDeviceSMatrix(config, wavelength_um) if precomputed
+            else LiveDeviceSMatrix(config, wavelength_um))
+
+
+def MMI_SMatrix(config_or_wavelength, wavelength_um=None, example=False,
+                precomputed=True, engine="eigenmode"):
+    """S-matrix of an MMI device.
+
+    Config-driven form (preferred): MMI_SMatrix(config, wavelength_um) where config
+    is a path to a device config.json (or a loaded dict). precomputed=True (default)
+    interpolates the device's precomputed band; precomputed=False runs it live.
+
+    Legacy form: MMI_SMatrix(wavelength_um, ...) uses the module-global default 2x2
+    device (kept for older scripts). engine="cw" selects the legacy Hilbert method.
+    example=True returns the ideal coupler matrix for the device kind.
     """
+    if isinstance(config_or_wavelength, (str, dict)):
+        config = _cfg(config_or_wavelength)
+        if example:
+            return (np.array([[1.0]]) if config["kind"] == "1x1"
+                    else np.array([[1, 1j], [1j, 1]]) / np.sqrt(2))
+        return DeviceSMatrix(config, wavelength_um, precomputed=precomputed)
+
+    # ---- legacy float-wavelength form (default 2x2 module-global device) ----
+    wl = config_or_wavelength
     if example:
-        return np.array([[1, 1j], [1j, 1]])/np.sqrt(2)
+        return np.array([[1, 1j], [1j, 1]]) / np.sqrt(2)
     if precomputed:
-        if engine == "cw":
-            return FittedSMatrix(wavelength_um)
-        return EigenmodeSMatrix(wavelength_um)
-    if engine == "cw":
-        return main(wavelength_um=wavelength_um, resolution=12, visualise=False)
-    return LiveEigenmodeSMatrix(wavelength_um)
+        return FittedSMatrix(wl) if engine == "cw" else EigenmodeSMatrix(wl)
+    return main(wavelength_um=wl, resolution=12, visualise=False) if engine == "cw" else LiveEigenmodeSMatrix(wl)
 
 
 if __name__ == "__main__":

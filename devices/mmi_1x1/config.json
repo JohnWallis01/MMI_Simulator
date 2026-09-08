@@ -1,0 +1,16 @@
+{
+  "name": "mmi_1x1",
+  "description": "Centred (symmetric) 1x1 relay MMI: 0 dB self-image at 1550 nm (W=14.6, L=266 um). Same length/material as mmi_2x2, so its S21 follows the 2x2 S31 in magnitude (+3 dB), dispersion and phase up to a constant offset. 0.09 dB loss at 1550 nm.",
+  "kind": "1x1",
+  "material": {"core_index": 1.974, "clad_index": 1.4657},
+  "waveguide": {"sm_length": 50.0, "sm_width": 1.0, "taper_length": 50.0, "taper_output_width": 5.0},
+  "mmi": {"length": 266.0, "width": 14.6},
+  "ports": {
+    "inputs":  [{"name": "IN", "y": 0.0}],
+    "outputs": [{"name": "OUT", "y": 0.0}],
+    "drive": "IN"
+  },
+  "eigenmode": {"band_um": [1.4, 1.7], "nfreq": 140, "resolution": 12, "decay_by": 0.001,
+                "monitor_height": 6.0, "source_offset": 8.0, "monitor_offset": 20.0},
+  "precomputed": "precomputed.npz"
+}
