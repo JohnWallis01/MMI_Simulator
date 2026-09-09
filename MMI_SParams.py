@@ -568,8 +568,14 @@ def RunDeviceEigenmodeBand(config, nfreq=None, resolution=None, decay_by=None, b
     return wl[order], S[:, order]
 
 
-def AssembleSMatrix(config, S_row):
-    """Assemble the device S-matrix from the per-output transmission row."""
+def AssembleSMatrix(config, S_row, reflection=None):
+    """Assemble the device S-matrix from the per-output transmission row.
+
+    For kind="crossing" the device is 4-port and only the LEFT-driven row is
+    simulated (through + the two orthogonal-arm crosstalks) plus the input
+    reflection; the full 4x4 is filled in by the crossing's C4v symmetry (all
+    four ports equivalent). Pass reflection = S11 (LEFT<-LEFT) for that.
+    """
     kind = config["kind"]
     out_names = [p["name"] for p in config["ports"]["outputs"]]
     if kind == "1x1":
@@ -578,6 +584,20 @@ def AssembleSMatrix(config, S_row):
         thru = S_row[out_names.index(config["ports"]["through"])]
         cross = S_row[out_names.index(config["ports"]["cross"])]
         return np.array([[thru, cross], [cross, thru]], dtype=complex)
+    if kind == "crossing":
+        # ports ordered [LEFT, THROUGH, TOP, BOTTOM]; through = opposite port,
+        # top/bottom = the two perpendicular (cross) ports.
+        t = S_row[out_names.index("THROUGH")]
+        c = 0.5 * (S_row[out_names.index("TOP")] + S_row[out_names.index("BOTTOM")])
+        r = 0.0 + 0.0j if reflection is None else reflection
+        # index 0=LEFT 1=THROUGH 2=TOP 3=BOTTOM; opposite pairs (0,1) and (2,3)
+        # carry the through amplitude t, every perpendicular pair carries c.
+        S = np.full((4, 4), c, dtype=complex)
+        S[0, 1] = S[1, 0] = t
+        S[2, 3] = S[3, 2] = t
+        for i in range(4):
+            S[i, i] = r
+        return S
     raise ValueError(f"unknown device kind {kind!r}")
 
 
@@ -623,6 +643,158 @@ def LiveDeviceSMatrix(config, wavelength_um, **overrides):
     wl, fits = cache
     S_row = _eval_columns(wl, fits, wavelength_um, f"live band for {config['name']}")
     return AssembleSMatrix(config, S_row)
+
+
+# ---------------------------------------------------------------------------
+# Waveguide crossing (kind="crossing"): two orthogonal 1x1 self-imaging MMI
+# relays crossing at the centre. Unlike the 1x1/2x2 devices, the geometry is a
+# CROSS (an x-arm and a y-arm), so it has its own builder and eigenmode run: the
+# LEFT arm is driven and monitors sit on the THROUGH (opposite) arm, the TOP and
+# BOTTOM (orthogonal) arms, and the input (for reflection). The multimode length
+# self-images the input at the far port so the perpendicular arm sees near-zero
+# mode overlap -> low crosstalk. AssembleSMatrix fills the 4x4 by C4v symmetry.
+# precomputed.npz: wavelengths (N,), S (N,3)=[THROUGH,TOP,BOTTOM], S_refl (N,).
+# ---------------------------------------------------------------------------
+
+_crossing_fit_cache = {}
+_crossing_live_cache = {}
+
+
+def _crossing_prism(cx, cy, lx, ly, core_eps):
+    """Axis-aligned rectangle centred at (cx,cy), size (lx,ly)."""
+    hx, hy = lx / 2.0, ly / 2.0
+    verts = [mp.Vector3(cx - hx, cy - hy), mp.Vector3(cx + hx, cy - hy),
+             mp.Vector3(cx + hx, cy + hy), mp.Vector3(cx - hx, cy + hy)]
+    return mp.Prism(verts, height=mp.inf, material=mp.Medium(epsilon=core_eps))
+
+
+def _crossing_taper(x0, y0, direction, length, w_in, w_out, axis, core_eps):
+    """Linear taper along `axis` ('x'/'y'), `direction` +/-1, w_in at (x0,y0)."""
+    if axis == 'x':
+        xe = x0 + direction * length
+        v = [mp.Vector3(x0, y0 - w_in / 2), mp.Vector3(xe, y0 - w_out / 2),
+             mp.Vector3(xe, y0 + w_out / 2), mp.Vector3(x0, y0 + w_in / 2)]
+    else:
+        ye = y0 + direction * length
+        v = [mp.Vector3(x0 - w_in / 2, y0), mp.Vector3(x0 - w_out / 2, ye),
+             mp.Vector3(x0 + w_out / 2, ye), mp.Vector3(x0 + w_in / 2, y0)]
+    return mp.Prism(v, height=mp.inf, material=mp.Medium(epsilon=core_eps))
+
+
+def BuildCrossingGeometry(config):
+    """Geometry for kind="crossing": two orthogonal strip->taper->MMI->taper->strip
+    arms sharing a central mmi_w x mmi_w square. Returns (geometry, cell, reach)."""
+    _ensure_meep()
+    wg, mm = config["waveguide"], config["mmi"]
+    core_eps = config["material"]["core_index"] ** 2
+    sm_len, sm_w = wg["sm_length"], wg["sm_width"]
+    tp_len, tp_w = wg["taper_length"], wg["taper_output_width"]
+    L, W = mm["length"], mm["width"]
+    reach = L / 2.0 + tp_len + sm_len
+    cell = mp.Vector3(2 * reach, 2 * reach, 0)
+    g = []
+    # horizontal (x) arm
+    g.append(_crossing_prism(-(reach - sm_len / 2), 0, sm_len, sm_w, core_eps))
+    g.append(_crossing_prism(+(reach - sm_len / 2), 0, sm_len, sm_w, core_eps))
+    g.append(_crossing_taper(-(L / 2 + tp_len), 0, +1, tp_len, sm_w, tp_w, 'x', core_eps))
+    g.append(_crossing_taper(+(L / 2 + tp_len), 0, -1, tp_len, sm_w, tp_w, 'x', core_eps))
+    g.append(_crossing_prism(0, 0, L, W, core_eps))
+    # vertical (y) arm
+    g.append(_crossing_prism(0, -(reach - sm_len / 2), sm_w, sm_len, core_eps))
+    g.append(_crossing_prism(0, +(reach - sm_len / 2), sm_w, sm_len, core_eps))
+    g.append(_crossing_taper(0, -(L / 2 + tp_len), +1, tp_len, sm_w, tp_w, 'y', core_eps))
+    g.append(_crossing_taper(0, +(L / 2 + tp_len), -1, tp_len, sm_w, tp_w, 'y', core_eps))
+    g.append(_crossing_prism(0, 0, W, L, core_eps))
+    return g, cell, reach
+
+
+def RunCrossingEigenmodeBand(config, nfreq=None, resolution=None, decay_by=None,
+                             band_um=None):
+    """Broadband eigenmode run of a crossing: drive LEFT, monitor THROUGH/TOP/
+    BOTTOM and the input reflection. Returns (wl ascending, S (3,N)=[THROUGH,
+    TOP,BOTTOM], S_refl (N,)) -- forward output coeff / forward input coeff."""
+    _ensure_meep()
+    eig = config["eigenmode"]
+    nfreq = int(nfreq or eig["nfreq"])
+    resolution = int(resolution or eig["resolution"])
+    decay_by = float(decay_by or eig["decay_by"])
+    band_um = tuple(band_um or eig["band_um"])
+    monh = eig.get("monitor_height", 6.0)
+    soff = eig.get("source_offset", 5.0)
+    moff = eig.get("monitor_offset", 15.0)
+
+    geometry, cell, reach = BuildCrossingGeometry(config)
+    x_src, x_in, x_out = -reach + soff, -reach + moff, reach - moff
+    y_arm = reach - moff
+    fmin, fmax = 1.0 / band_um[1], 1.0 / band_um[0]
+    fcen, df = 0.5 * (fmin + fmax), 1.25 * (fmax - fmin)
+
+    sources = [mp.EigenModeSource(src=mp.GaussianSource(fcen, fwidth=df),
+                                  center=mp.Vector3(x_src, 0.0), size=mp.Vector3(0, monh),
+                                  eig_band=1, eig_parity=mp.ODD_Z, eig_match_freq=True,
+                                  direction=mp.X)]
+    sim = mp.Simulation(cell_size=cell, boundary_layers=[mp.PML(1.0)], geometry=geometry,
+                        sources=sources, resolution=resolution,
+                        default_material=mp.Medium(epsilon=config["material"]["clad_index"]**2))
+    freqs = np.linspace(fmin, fmax, nfreq)
+    mon_in = sim.add_mode_monitor(freqs, mp.FluxRegion(center=mp.Vector3(x_in, 0.0), size=mp.Vector3(0, monh)))
+    mon_thru = sim.add_mode_monitor(freqs, mp.FluxRegion(center=mp.Vector3(x_out, 0.0), size=mp.Vector3(0, monh)))
+    mon_top = sim.add_mode_monitor(freqs, mp.FluxRegion(center=mp.Vector3(0.0, +y_arm), size=mp.Vector3(monh, 0)))
+    mon_bot = sim.add_mode_monitor(freqs, mp.FluxRegion(center=mp.Vector3(0.0, -y_arm), size=mp.Vector3(monh, 0)))
+
+    sim.run(until_after_sources=int(SIN_index * cell[0] + 100))
+    sim.run(until_after_sources=mp.stop_when_fields_decayed(
+        50, mp.Ez, mp.Vector3(x_out, 0.0), decay_by))
+
+    def coeff(mon, direction, forward=True):
+        r = sim.get_eigenmode_coefficients(mon, [1], eig_parity=mp.ODD_Z, direction=direction)
+        return r.alpha[0, :, 0 if forward else 1]
+
+    a1 = coeff(mon_in, mp.X, True)
+    S = np.array([coeff(mon_thru, mp.X, True) / a1,
+                  coeff(mon_top, mp.Y, True) / a1,
+                  coeff(mon_bot, mp.Y, False) / a1])      # (3, N)
+    S_refl = coeff(mon_in, mp.X, False) / a1
+    wl = 1.0 / freqs
+    order = np.argsort(wl)
+    return wl[order], S[:, order], S_refl[order]
+
+
+def _load_crossing_fit(config):
+    key = config["_dir"] + "/" + config["precomputed"]
+    if key not in _crossing_fit_cache:
+        data = np.load(os.path.join(config["_dir"], config["precomputed"]))
+        wl, fits = _fit_columns(data["wavelengths"], data["S"])          # 3 output columns
+        refl = data["S_refl"] if "S_refl" in data.files else np.zeros(len(wl), complex)
+        _, refl_fit = _fit_columns(data["wavelengths"], refl[:, None])
+        _crossing_fit_cache[key] = (wl, fits, refl_fit[0])
+    return _crossing_fit_cache[key]
+
+
+def _crossing_from_fit(config, wl, fits, refl_fit, wavelength_um, what):
+    S_row = _eval_columns(wl, fits, wavelength_um, what)
+    mf, pf = refl_fit
+    refl = 10 ** (mf(wavelength_um) / 20) * np.exp(1j * pf(wavelength_um))
+    return AssembleSMatrix(config, S_row, reflection=refl)
+
+
+def PrecomputedCrossingSMatrix(config, wavelength_um):
+    wl, fits, refl_fit = _load_crossing_fit(config)
+    return _crossing_from_fit(config, wl, fits, refl_fit, wavelength_um,
+                              f"precomputed data for {config['name']}")
+
+
+def LiveCrossingSMatrix(config, wavelength_um, **overrides):
+    key = config["_dir"]
+    cache = _crossing_live_cache.get(key)
+    if cache is None or not (cache[0][0] <= wavelength_um <= cache[0][-1]):
+        wl, S, S_refl = RunCrossingEigenmodeBand(config, **overrides)   # S (3, N)
+        w2, fits = _fit_columns(wl, S.T)
+        _, refl_fit = _fit_columns(wl, S_refl[:, None])
+        _crossing_live_cache[key] = cache = (w2, fits, refl_fit[0])
+    wl, fits, refl_fit = cache
+    return _crossing_from_fit(config, wl, fits, refl_fit, wavelength_um,
+                              f"live band for {config['name']}")
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +873,9 @@ def DeviceSMatrix(config, wavelength_um, precomputed=True, temperatures=None):
     if config.get("kind") == "mzi_node":
         Tm, Ti = _mzi_temperatures(config, temperatures)
         return MZINodeSMatrix(config, wavelength_um, Tm, Ti, precomputed=precomputed)
+    if config.get("kind") == "crossing":
+        return (PrecomputedCrossingSMatrix(config, wavelength_um) if precomputed
+                else LiveCrossingSMatrix(config, wavelength_um))
     return (PrecomputedDeviceSMatrix(config, wavelength_um) if precomputed
             else LiveDeviceSMatrix(config, wavelength_um))
 
@@ -722,8 +897,15 @@ def MMI_SMatrix(config_or_wavelength, wavelength_um=None, example=False,
     if isinstance(config_or_wavelength, (str, dict)):
         config = _cfg(config_or_wavelength)
         if example:
-            return (np.array([[1.0]]) if config["kind"] == "1x1"
-                    else np.array([[1, 1j], [1j, 1]]) / np.sqrt(2))
+            if config["kind"] == "1x1":
+                return np.array([[1.0]])
+            if config["kind"] == "crossing":
+                # ideal crossing: unit through, zero reflection/crosstalk. S_row
+                # is ordered like ports.outputs = [THROUGH, TOP, BOTTOM].
+                out_names = [p["name"] for p in config["ports"]["outputs"]]
+                ideal = [1.0 if n == "THROUGH" else 0.0 for n in out_names]
+                return AssembleSMatrix(config, ideal, reflection=0.0)
+            return np.array([[1, 1j], [1j, 1]]) / np.sqrt(2)
         return DeviceSMatrix(config, wavelength_um, precomputed=precomputed,
                              temperatures=temperatures)
 
