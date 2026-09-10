@@ -1,20 +1,20 @@
 {
   "name": "waveguide_crossing",
-  "description": "Silicon-nitride MMI waveguide crossing: two orthogonal 1x1 self-imaging MMI relays (W=10, L=254 um) crossing at the centre. Each 1 um strip tapers into the multimode section, whose length self-images the input at the far port; the perpendicular arm sees near-zero mode overlap. Tuned so the low-loss window is centred at 1550 nm: through -0.08 dB, crosstalk per orthogonal arm -85 dB, return -31 dB. Broadband eigenmode data over 1400-1700 nm (res 12).",
+  "description": "Silicon-nitride MMI waveguide crossing: two orthogonal 1x1 self-imaging MMI relays (W=8.5, L=186 um) crossing at the centre. Each 1 um strip tapers into the multimode section, whose length self-images the input at the far port; the perpendicular arm sees near-zero mode overlap. Tuned so the low-loss window is centred at 1550 nm: through -0.10 dB, crosstalk per orthogonal arm -85 dB, return -31 dB. Broadband eigenmode data over 1400-1700 nm (res 12).",
   "kind": "crossing",
   "material": {
     "core_index": 1.974,
     "clad_index": 1.4657
   },
   "waveguide": {
-    "sm_length": 25.0,
+    "sm_length": 15.0,
     "sm_width": 1.0,
     "taper_length": 50.0,
     "taper_output_width": 5.0
   },
   "mmi": {
-    "length": 254.0,
-    "width": 10.0
+    "length": 186.0,
+    "width": 8.5
   },
   "ports": {
     "inputs": [
@@ -53,8 +53,8 @@
     "decay_by": 0.01,
     "monitor_height": 6.0,
     "source_offset": 5.0,
-    "monitor_offset": 15.0
+    "monitor_offset": 10.0
   },
   "precomputed": "precomputed.npz",
-  "notes": "Supported natively by MMI_SParams (kind=\"crossing\"): MMI_SMatrix(config, wavelength_um) returns the 4x4 S-matrix in port order [LEFT, THROUGH, TOP, BOTTOM], filled from the LEFT-driven row (through + the two orthogonal-arm crosstalks) and the input reflection by C4v symmetry. precomputed=True (default) interpolates precomputed.npz; precomputed=False runs it live via BuildCrossingGeometry/RunCrossingEigenmodeBand. precomputed.npz keys: wavelengths (N,), S (N,3)=[THROUGH,TOP,BOTTOM] forward transmission, S_refl (N,) input reflection. The standalone builder/plotters live in ai_workspace/WaveguideCrossing/ (crossing_common.py, tune_crossing.py)."
+  "notes": "Supported natively by MMI_SParams (kind=\"crossing\"): MMI_SMatrix(config, wavelength_um) returns the 4x4 S-matrix in port order [LEFT, THROUGH, TOP, BOTTOM], filled from the LEFT-driven row (through + the two orthogonal-arm crosstalks) and the input reflection by C4v symmetry. precomputed=True (default) interpolates precomputed.npz; precomputed=False runs it live via BuildCrossingGeometry/RunCrossingEigenmodeBand. precomputed.npz keys: wavelengths (N,), S (N,3)=[THROUGH,TOP,BOTTOM] forward transmission, S_refl (N,) input reflection. Standalone builder/plotters live in ai_workspace/WaveguideCrossing/ (crossing_common.py, tune_fast.py)."
 }
